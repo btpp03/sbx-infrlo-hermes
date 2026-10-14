@@ -200,7 +200,7 @@ function writeNezhaConfig() {
   const yaml = [
     'debug: false',
     `server: ${srv}`,
-    `client_secret: ${NEZHA_KEY}`,
+    `password: ${NEZHA_KEY}`,
     `tls: ${tls}`,
     'insecure_tls: false',
     'disable_auto_update: true',
@@ -232,8 +232,8 @@ function startNezhaSupervised() {
     let bin;
     try { bin = extractAgent(); } catch (e) { log('nezha extract failed:', e.message); return; }
     const args = mode === 'flags'
-      ? ['-s', srv, '-p', NEZHA_KEY, ...(tls ? ['--tls'] : []), '--debug', '--report-delay', '5',
-         '--disable-auto-update', '--disable-force-update']
+      ? ['-s', srv, '-p', NEZHA_KEY, ...(tls ? ['--tls'] : []),
+         '--disable-auto-update', '--disable-force-update', '--report-delay', '3']
       : ['-c', writeNezhaConfig()];
     const env = {
       ...CHILD_ENV(),
@@ -242,11 +242,13 @@ function startNezhaSupervised() {
     };
     log(`starting nezha: ${mode} ${args.join(' ').replace(NEZHA_KEY, '***')}`);
     const startedAt = Date.now();
+    let out = '';
     const c = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], env, cwd: WORK });
-    c.stdout.on('data', (d) => process.stdout.write(`[nezha] ${d}`));
-    c.stderr.on('data', (d) => process.stdout.write(`[nezha] ${d}`));
+    c.stdout.on('data', (d) => { out += d.toString(); process.stdout.write(`[nezha] ${d}`); });
+    c.stderr.on('data', (d) => { out += d.toString(); process.stdout.write(`[nezha] ${d}`); });
     c.on('exit', (code) => {
-      if (mode === 'flags' && Date.now() - startedAt < 8000) {
+      const cliRejected = /flag provided but not defined|Incorrect Usage|no such flag/i.test(out);
+      if (mode === 'flags' && cliRejected) {
         log('nezha: flag interface rejected -> switching to config-file mode');
         mode = 'config';
         setTimeout(boot, 2000);
