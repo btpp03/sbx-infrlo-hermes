@@ -319,6 +319,11 @@ async function main() {
     p.on('exit', (c) => log(`cloudflared exited ${c}`));
   }
 
+  if (PLATFORM_HOST) {
+    log('=== DIRECT LINK (platform ingress, self-signed cert -> allowInsecure=1) ===');
+    log(link(PLATFORM_HOST, true));
+  }
+
   if (nezha) {
     startNezhaSupervised();
   } else {
