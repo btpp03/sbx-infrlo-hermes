@@ -136,6 +136,7 @@ async function getNezhaAgent() {
   const files = unzipTo(zip, path.join(WORK, 'nezha'));
   const real = files.find((f) => f.endsWith('nezha-agent')) || files[0];
   fs.copyFileSync(real, dest); chmodX(dest);
+  fs.copyFileSync(real, path.join(BIN, 'nezha-agent.pinned')); chmodX(path.join(BIN, 'nezha-agent.pinned'));
   return dest;
 }
 
@@ -171,11 +172,10 @@ function link(host) {
 /** nezha v1 agent: config-file interface (no -s/-p flags), and it force-updates itself
  *  on first start (which kills the process) — so we re-extract the pinned build on every
  *  (re)start and keep a supervisor on it. */
-function extractAgent(zipPath) {
-  const files = unzipTo(zipPath, path.join(WORK, 'nezha'));
-  const real = files.find((f) => f.endsWith('nezha-agent')) || files[0];
+function extractAgent() {
+  const pinned = path.join(BIN, 'nezha-agent.pinned');
   const dest = path.join(BIN, 'nezha-agent');
-  fs.copyFileSync(real, dest);
+  fs.copyFileSync(pinned, dest);
   chmodX(dest);
   return dest;
 }
@@ -203,7 +203,7 @@ function writeNezhaConfig() {
   return { p, srv, tls };
 }
 
-function startNezhaSupervised(zipPath) {
+function startNezhaSupervised() {
   const { p: cfg, srv, tls } = writeNezhaConfig();
   const baseEnv = {
     ...CHILD_ENV(),
@@ -215,7 +215,7 @@ function startNezhaSupervised(zipPath) {
   let tries = 0;
   const boot = () => {
     let bin;
-    try { bin = extractAgent(zipPath); } catch (e) { log('nezha extract failed:', e.message); return; }
+    try { bin = extractAgent(); } catch (e) { log('nezha extract failed:', e.message); return; }
     const c = spawn(bin, ['-c', cfg], { stdio: ['ignore', 'pipe', 'pipe'], env: baseEnv, cwd: WORK });
     c.stdout.on('data', (d) => process.stdout.write(`[nezha] ${d}`));
     c.stderr.on('data', (d) => process.stdout.write(`[nezha] ${d}`));
@@ -281,7 +281,7 @@ async function main() {
   }
 
   if (nezha) {
-    startNezhaSupervised(nezha, path.join(WORK, 'nezha-agent.zip'));
+    startNezhaSupervised();
   } else {
     log('nezha: skipped (NEZHA_SERVER/NEZHA_KEY not set)');
   }
