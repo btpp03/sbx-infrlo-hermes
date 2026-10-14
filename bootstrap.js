@@ -168,6 +168,7 @@ function writeXrayConfig() {
 }
 
 const LIVE = {};
+const NEZHA_TAIL = [];
 function childrenAlive() {
   return Object.entries(LIVE).map(([k, v]) => `${k}:${v ? 'up' : 'down'}`).join(',') || 'none';
 }
@@ -237,7 +238,7 @@ function startNezhaSupervised() {
     let bin;
     try { bin = extractAgent(); } catch (e) { log('nezha extract failed:', e.message); return; }
     const args = mode === 'flags'
-      ? ['-s', srv, '-p', NEZHA_KEY, ...(tls ? ['--tls'] : []),
+      ? ['-s', srv, '-p', NEZHA_KEY, ...(tls ? ['--tls'] : []), '--debug',
          '--disable-auto-update', '--disable-force-update', '--report-delay', '3']
       : ['-c', writeNezhaConfig()];
     const env = {
@@ -248,9 +249,20 @@ function startNezhaSupervised() {
     log(`starting nezha: ${mode} ${args.join(' ').replace(NEZHA_KEY, '***')}`);
     const startedAt = Date.now();
     let out = '';
+    const logFile = path.join(WORK, 'nezha.log');
+    let logFd = null;
+    try { logFd = fs.openSync(logFile, 'a'); } catch {}
+    const sink = (d) => {
+      const t = d.toString();
+      out += t;
+      process.stdout.write(`[nezha] ${t}`);
+      NEZHA_TAIL.push(...t.split('\n').filter(Boolean).map((l) => `[${new Date().toISOString().slice(11, 19)}] ${l.trim()}`));
+      while (NEZHA_TAIL.length > 40) NEZHA_TAIL.shift();
+      if (logFd !== null) { try { fs.writeSync(logFd, t); } catch {} }
+    };
     const c = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], env, cwd: WORK });
-    c.stdout.on('data', (d) => { out += d.toString(); process.stdout.write(`[nezha] ${d}`); });
-    c.stderr.on('data', (d) => { out += d.toString(); process.stdout.write(`[nezha] ${d}`); });
+    c.stdout.on('data', sink);
+    c.stderr.on('data', sink);
     c.on('exit', (code) => {
       const cliRejected = /flag provided but not defined|Incorrect Usage|no such flag/i.test(out);
       if (mode === 'flags' && cliRejected) {
@@ -340,7 +352,8 @@ async function main() {
   for (;;) {
     await sleep(60000);
     i++;
-    log(`alive ${i}m rss=${Math.round(process.memoryUsage().rss / 1048576)}MB children=${childrenAlive()}`);
+    const tail = NEZHA_TAIL.slice(-2).join(' | ');
+    log(`alive ${i}m rss=${Math.round(process.memoryUsage().rss / 1048576)}MB children=${childrenAlive()} nezhaTail=${tail || '(silent)'}`);
   }
 }
 
