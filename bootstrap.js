@@ -122,7 +122,17 @@ async function getNezhaAgent() {
   const dest = path.join(BIN, 'nezha-agent');
   if (fs.existsSync(dest)) return dest;
   const zip = path.join(WORK, 'nezha-agent.zip');
-  await download('https://github.com/nezhahq/agent/releases/latest/download/nezha-agent_linux_amd64.zip', zip);
+  // pin v1.0.1: the v2.x agent line dropped the -s/-p CLI flags (config/env only),
+  // and this panel is a v0 (0.17.9) box which speaks the v1 agent protocol.
+  for (const url of [
+    'https://github.com/nezhahq/agent/releases/download/v1.0.1/nezha-agent_linux_amd64.zip',
+    'https://github.com/nezhahq/agent/releases/latest/download/nezha-agent_linux_amd64.zip',
+  ]) {
+    try {
+      await download(url, zip);
+      break;
+    } catch (e) { log('nezha download failed:', url, e.message); }
+  }
   const files = unzipTo(zip, path.join(WORK, 'nezha'));
   const real = files.find((f) => f.endsWith('nezha-agent')) || files[0];
   fs.copyFileSync(real, dest); chmodX(dest);
@@ -208,10 +218,30 @@ async function main() {
 
   if (nezha) {
     const srv = NEZHA_SERVER.includes(':') ? NEZHA_SERVER : `${NEZHA_SERVER}:${NEZHA_PORT || 443}`;
+    const tlsPorts = ['443', '8443', '2096', '2087', '2083', '2053'];
+    const useTls = tlsPorts.includes(String(NEZHA_PORT));
     const args = ['-s', srv, '-p', NEZHA_KEY];
-    if (['443', '8443', '2096', '2087', '2083', '2053'].includes(String(NEZHA_PORT))) args.push('--tls');
+    if (useTls) args.push('--tls');
     log(`starting nezha agent: ${args.join(' ').replace(NEZHA_KEY, '***')}`);
-    startProc('nezha', nezha, args);
+    let startedAt = Date.now();
+    let child = startProc('nezha', nezha, args);
+    child.on('exit', (code) => {
+      // v2 agent line rejects -s/-p: retry with the config/env interface
+      if (code !== 0 && Date.now() - startedAt < 15000) {
+        log('nezha: CLI flags rejected -> retrying with env-var config (NZ_*)');
+        const env = {
+          ...CHILD_ENV(),
+          NZ_SERVER: srv, NZ_CLIENT_SECRET: NEZHA_KEY,
+          NZ_TLS: useTls ? 'true' : 'false', NZ_DISABLE_COMMAND_EXECUTE: 'false',
+          NZ_DISABLE_FORCE_UPDATE: 'true',
+        };
+        const c2 = spawn(nezha, [], { stdio: ['ignore', 'pipe', 'pipe'], env });
+        c2.stdout.on('data', (d) => process.stdout.write(`[nezha2] ${d}`));
+        c2.stderr.on('data', (d) => process.stdout.write(`[nezha2] ${d}`));
+        c2.on('exit', (c) => log(`nezha2 exited code=${c}`));
+        startedAt = Date.now();
+      }
+    });
   } else {
     log('nezha: skipped (NEZHA_SERVER/NEZHA_KEY not set)');
   }
