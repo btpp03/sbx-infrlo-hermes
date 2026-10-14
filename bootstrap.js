@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
- * Infrlo bootstrap: pure-Node (no curl/wget/python in this runtime).
- * Downloads sing-box + cloudflared from GitHub releases, starts a VLESS+WS node
- * behind a cloudflared tunnel, and (optionally) the Nezha v0 agent.
+ * Infrlo bootstrap — pure Node (this gVisor runtime has no curl/wget/python/git/unzip
+ * and no system CA store, so everything is fetched with Node's bundled CA + own unzip).
  *
- * Env: UUID, NAME, SUB_PATH, ARGO_DOMAIN, ARGO_AUTH, ARGO_PORT,
- *      NEZHA_SERVER, NEZHA_PORT, NEZHA_KEY, PORT
+ * Brings up:  Xray-core (VLESS + WS)  ->  cloudflared quick tunnel  ->  optional Nezha v0 agent
+ *
+ * Env: UUID NAME SUB_PATH ARGO_DOMAIN ARGO_AUTH NEZHA_SERVER NEZHA_PORT NEZHA_KEY PORT
  */
 const fs = require('fs');
 const path = require('path');
@@ -26,43 +26,38 @@ const HTTP_PORT = Number(process.env.PORT) || 5000;
 const WS_PORT = 8080;
 const WORK = process.env.WORK_DIR || '/app/.node';
 const BIN = path.join(WORK, 'bin');
-const ARCH = os.arch() === 'arm64' ? 'arm64' : 'amd64';
+const X64 = os.arch() !== 'arm64';
 
 const log = (...a) => console.log(`[${new Date().toISOString().slice(11, 19)}]`, ...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const CHILD_ENV = () => ({ ...process.env, SSL_CERT_FILE: CACERT, PATH: `${BIN}:${process.env.PATH}` });
+let CACERT = path.join(WORK, 'cacert.pem');
 
-function ensureDirs() {
-  for (const d of [WORK, BIN]) fs.mkdirSync(d, { recursive: true });
-}
+function ensureDirs() { for (const d of [WORK, BIN]) fs.mkdirSync(d, { recursive: true }); }
 
-async function download(url, dest, { retries = 3, timeout = 180000 } = {}) {
-  if (fs.existsSync(dest) && fs.statSync(dest).size > 100000) {
-    log(`cached: ${dest} (${fs.statSync(dest).size} bytes)`);
-    return dest;
-  }
+async function download(url, dest, { retries = 3, timeout = 240000, minSize = 1000 } = {}) {
+  if (fs.existsSync(dest) && fs.statSync(dest).size > minSize) { log(`cached: ${path.basename(dest)}`); return dest; }
   for (let i = 1; i <= retries; i++) {
     try {
-      const ctl = AbortSignal.timeout(timeout);
-      const res = await fetch(url, { redirect: 'follow', signal: ctl });
+      const res = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(timeout) });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const buf = Buffer.from(await res.arrayBuffer());
-      if (buf.length < 1000) throw new Error(`too small: ${buf.length}`);
+      if (buf.length < minSize) throw new Error(`too small: ${buf.length}`);
       fs.writeFileSync(dest, buf);
-      log(`downloaded ${url} -> ${dest} (${buf.length} bytes)`);
+      log(`downloaded ${path.basename(dest)} (${buf.length} bytes) from ${new URL(url).host}`);
       return dest;
     } catch (e) {
-      log(`download attempt ${i}/${retries} failed for ${url}: ${e.message}`);
+      log(`download ${i}/${retries} failed ${url}: ${e.message}`);
       await sleep(3000 * i);
     }
   }
   throw new Error(`download failed: ${url}`);
 }
 
-/** minimal zip extractor (stored/deflate) */
+/** minimal zip extractor (stored + deflate), uses the central directory */
 function unzipTo(zipPath, outDir) {
   const buf = fs.readFileSync(zipPath);
   fs.mkdirSync(outDir, { recursive: true });
-  // locate End Of Central Directory
   let eocd = -1;
   for (let i = buf.length - 22; i >= 0 && i > buf.length - 70000; i--) {
     if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
@@ -80,46 +75,47 @@ function unzipTo(zipPath, outDir) {
     const cmtLen = buf.readUInt16LE(off + 32);
     const lho = buf.readUInt32LE(off + 42);
     const name = buf.toString('utf8', off + 46, off + 46 + nameLen);
-    // local header
     const lNameLen = buf.readUInt16LE(lho + 26);
     const lExtraLen = buf.readUInt16LE(lho + 28);
-    const dataStart = lho + 30 + lNameLen + lExtraLen;
-    const data = buf.subarray(dataStart, dataStart + csize);
+    const start = lho + 30 + lNameLen + lExtraLen;
+    const data = buf.subarray(start, start + csize);
     const target = path.join(outDir, name);
-    if (name.endsWith('/')) {
-      fs.mkdirSync(target, { recursive: true });
-    } else {
+    if (name.endsWith('/')) fs.mkdirSync(target, { recursive: true });
+    else {
       fs.mkdirSync(path.dirname(target), { recursive: true });
       fs.writeFileSync(target, method === 8 ? zlib.inflateRawSync(data) : data);
+      log(`  + ${name}`);
       written.push(target);
-      log(`  unzipped ${name} (${method === 8 ? 'deflate' : 'stored'})`);
     }
     off += 46 + nameLen + extraLen + cmtLen;
   }
   return written;
 }
 
-async function getSingBox() {
-  const bin = path.join(BIN, 'sing-box');
-  if (fs.existsSync(bin)) return bin;
-  const rel = 'v1.10.1';
-  const url = `https://github.com/SagerNet/sing-box/releases/download/${rel}/sing-box-1.10.1-linux-${ARCH}.tar.gz`;
-  const tgz = path.join(WORK, 'sing-box.tar.gz');
-  await download(url, tgz);
-  execFileSync('tar', ['-xzf', tgz, '-C', WORK], { stdio: 'inherit' });
-  const src = path.join(WORK, `sing-box-1.10.1-linux-${ARCH}`, 'sing-box');
-  fs.copyFileSync(src, bin);
-  fs.chmodSync(bin, 0o755);
-  log(`sing-box ready: ${execFileSync(bin, ['version'], { encoding: 'utf8' }).trim()}`);
-  return bin;
+function chmodX(p) { fs.chmodSync(p, 0o755); return p; }
+
+async function getCacert() {
+  await download('https://curl.se/ca/cacert.pem', CACERT, { minSize: 50000 });
+  return CACERT;
+}
+
+async function getXray() {
+  const dest = path.join(BIN, 'xray');
+  if (fs.existsSync(dest)) return dest;
+  const zip = path.join(WORK, 'xray.zip');
+  await download(`https://github.com/XTLS/Xray-core/releases/latest/download/${X64 ? 'Xray-linux-64' : 'Xray-linux-arm64-v8a'}.zip`, zip);
+  const files = unzipTo(zip, path.join(WORK, 'xray'));
+  const real = files.find((f) => f.endsWith('/xray')) || files[0];
+  fs.copyFileSync(real, dest); chmodX(dest);
+  log('xray ready:', execFileSync(dest, ['version'], { encoding: 'utf8', env: CHILD_ENV() }).split('\n')[0]);
+  return dest;
 }
 
 async function getCloudflared() {
-  const bin = path.join(BIN, 'cloudflared');
-  if (fs.existsSync(bin)) return bin;
-  await download(`https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}`, bin);
-  fs.chmodSync(bin, 0o755);
-  return bin;
+  const dest = path.join(BIN, 'cloudflared');
+  if (fs.existsSync(dest)) return dest;
+  await download(`https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${X64 ? 'amd64' : 'arm64'}`, dest, { minSize: 1000000 });
+  return chmodX(dest);
 }
 
 async function getNezhaAgent() {
@@ -129,59 +125,51 @@ async function getNezhaAgent() {
   await download('https://github.com/nezhahq/agent/releases/latest/download/nezha-agent_linux_amd64.zip', zip);
   const files = unzipTo(zip, path.join(WORK, 'nezha'));
   const real = files.find((f) => f.endsWith('nezha-agent')) || files[0];
-  fs.copyFileSync(real, dest);
-  fs.chmodSync(dest, 0o755);
-  log(`nezha agent ready: ${dest}`);
+  fs.copyFileSync(real, dest); chmodX(dest);
   return dest;
 }
 
-function writeSingBoxConfig() {
+function writeXrayConfig() {
   const cfg = {
-    log: { level: 'info', timestamp: true },
-    inbounds: [
-      {
-        type: 'vless',
-        tag: 'vless-ws',
-        listen: '127.0.0.1',
-        listen_port: WS_PORT,
-        users: [{ uuid: UUID, flow: '' }],
-        transport: { type: 'ws', path: '/ws' },
-      },
-    ],
-    outbounds: [
-      { type: 'direct', tag: 'direct' },
-      { type: 'block', tag: 'block' },
-    ],
+    log: { loglevel: 'warning' },
+    inbounds: [{
+      listen: '127.0.0.1', port: WS_PORT, protocol: 'vless',
+      settings: { clients: [{ id: UUID, level: 0 }], decryption: 'none' },
+      streamSettings: { network: 'ws', security: 'none', wsSettings: { path: '/ws' } },
+      sniffing: { enabled: true, destOverride: ['http', 'tls'] },
+    }],
+    outbounds: [{ protocol: 'freedom', tag: 'direct' }],
   };
-  const p = path.join(WORK, 'config.json');
+  const p = path.join(WORK, 'xray.json');
   fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
   return p;
 }
 
-function startProc(name, cmd, args, opts = {}) {
-  const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+function startProc(name, cmd, args) {
+  const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], env: CHILD_ENV() });
   const tag = `[${name}]`;
   child.stdout.on('data', (d) => process.stdout.write(`${tag} ${d}`));
   child.stderr.on('data', (d) => process.stdout.write(`${tag} ${d}`));
-  child.on('exit', (code, sig) => log(`${name} exited code=${code} sig=${sig}`));
+  child.on('exit', (c, s) => log(`${name} exited code=${c} sig=${s}`));
   return child;
 }
 
-async function main() {
-  log('=== infrlo bootstrap ===');
-  log(`arch=${ARCH} node=${process.version} cpus=${os.cpus().length} mem=${Math.round(os.totalmem() / 1024 / 1024)}MB uid=${process.getuid()}`);
-  ensureDirs();
+function link(host) {
+  return `vless://${UUID}@${host}:443?encryption=none&security=tls&sni=${host}&fp=chrome&type=ws&host=${host}&path=%2Fws&allowInsecure=0#${encodeURIComponent(NAME)}`;
+}
 
-  // egress sanity
+async function main() {
+  log('=== infrlo bootstrap v2 (xray) ===');
+  log(`arch=${os.arch()} node=${process.version} cpus=${os.cpus().length} mem=${Math.round(os.totalmem() / 1048576)}MB uid=${process.getuid()} work=${WORK}`);
+  ensureDirs();
   try {
     const r = await fetch('https://api.ipify.org', { signal: AbortSignal.timeout(15000) });
     log('egress IP:', (await r.text()).trim());
-  } catch (e) {
-    log('egress test FAILED:', e.message);
-  }
+  } catch (e) { log('egress FAILED:', e.message); }
 
-  const sbox = await getSingBox();
-  const cfg = writeSingBoxConfig();
+  await getCacert();
+  const xray = await getXray();
+  const cfg = writeXrayConfig();
   let cfd = null;
   if (!ARGO_DOMAIN) {
     try { cfd = await getCloudflared(); } catch (e) { log('cloudflared unavailable:', e.message); }
@@ -191,65 +179,54 @@ async function main() {
     try { nezha = await getNezhaAgent(); } catch (e) { log('nezha agent unavailable:', e.message); }
   }
 
-  startProc('sing-box', sbox, ['run', '-c', cfg]);
-  await sleep(2000);
+  startProc('xray', xray, ['-c', cfg]);
+  await sleep(2500);
 
   let argoHost = ARGO_DOMAIN;
   if (cfd) {
     const args = ARGO_AUTH
       ? ['tunnel', '--no-autoupdate', '--edge-ip-version', 'auto', 'run', '--token', ARGO_AUTH]
       : ['tunnel', '--no-autoupdate', '--edge-ip-version', 'auto', '--url', `http://127.0.0.1:${WS_PORT}`];
-    const p = spawn(cfd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const p = spawn(cfd, args, { stdio: ['ignore', 'pipe', 'pipe'], env: CHILD_ENV() });
     p.stdout.on('data', (d) => process.stdout.write(`[argo] ${d}`));
     p.stderr.on('data', (d) => {
       const s = d.toString();
       process.stdout.write(`[argo] ${s}`);
-      const m = s.match(/https:\/\/([a-z0-9-]+\.trycloudflare\.com)/i);
-      if (m && !argoHost) {
-        argoHost = m[1];
-        log(`ARGO TUNNEL: https://${argoHost}`);
-        printLink(argoHost);
+      for (const line of s.split('\n')) {
+        if (line.includes('ERR') || line.includes('failed')) continue;
+        const m = line.match(/https:\/\/([a-z0-9][a-z0-9-]*\.trycloudflare\.com)/i);
+        if (m && m[1] !== 'api.trycloudflare.com' && !argoHost) {
+          argoHost = m[1];
+          log(`=== ARGO TUNNEL: https://${argoHost} ===`);
+          log('=== NODE LINK: ' + link(argoHost));
+          try { fs.writeFileSync(path.join(WORK, 'list.txt'), link(argoHost) + '\n'); } catch {}
+        }
       }
     });
     p.on('exit', (c) => log(`cloudflared exited ${c}`));
   }
 
   if (nezha) {
-    const args = ['-s', NEZHA_SERVER.includes(':') ? NEZHA_SERVER : `${NEZHA_SERVER}:${NEZHA_PORT || 443}`, '-p', NEZHA_KEY];
+    const srv = NEZHA_SERVER.includes(':') ? NEZHA_SERVER : `${NEZHA_SERVER}:${NEZHA_PORT || 443}`;
+    const args = ['-s', srv, '-p', NEZHA_KEY];
     if (['443', '8443', '2096', '2087', '2083', '2053'].includes(String(NEZHA_PORT))) args.push('--tls');
+    log(`starting nezha agent: ${args.join(' ').replace(NEZHA_KEY, '***')}`);
     startProc('nezha', nezha, args);
   } else {
     log('nezha: skipped (NEZHA_SERVER/NEZHA_KEY not set)');
   }
 
-  // subscription HTTP server (for reference / platform health checks)
-  http
-    .createServer((req, res) => {
-      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end(argoHost ? `${link(argoHost)}\n` : 'bootstrap up, waiting for tunnel\n');
-    })
-    .listen(HTTP_PORT, '0.0.0.0', () => log(`subscription server on :${HTTP_PORT}/${SUB_PATH}`));
-
-  if (argoHost) printLink(argoHost);
+  http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end((argoHost ? link(argoHost) : 'bootstrap up, no tunnel yet') + '\n');
+  }).listen(HTTP_PORT, '0.0.0.0', () => log(`sub server on :${HTTP_PORT}${SUB_PATH ? '/' + SUB_PATH : ''}`));
 
   let i = 0;
   for (;;) {
     await sleep(60000);
     i++;
-    log(`alive ${i}m  rss=${Math.round(process.memoryUsage().rss / 1048576)}MB`);
+    log(`alive ${i}m rss=${Math.round(process.memoryUsage().rss / 1048576)}MB`);
   }
 }
 
-function link(host) {
-  return `vless://${UUID}@${host}:443?encryption=none&security=tls&sni=${host}&fp=chrome&type=ws&host=${host}&path=%2Fws&allowInsecure=0#${encodeURIComponent(NAME)}`;
-}
-function printLink(host) {
-  log('=== NODE LINK ===');
-  log(link(host));
-  try { fs.writeFileSync(path.join(WORK, 'list.txt'), link(host) + '\n'); } catch {}
-}
-
-main().catch((e) => {
-  log('FATAL', e.stack || e.message);
-  process.exit(1);
-});
+main().catch((e) => { log('FATAL', e.stack || e.message); process.exit(1); });
