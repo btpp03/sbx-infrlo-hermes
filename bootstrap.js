@@ -168,6 +168,70 @@ function link(host) {
   return `vless://${UUID}@${host}:443?encryption=none&security=tls&sni=${host}&fp=chrome&type=ws&host=${host}&path=%2Fws&allowInsecure=0#${encodeURIComponent(NAME)}`;
 }
 
+/** nezha v1 agent: config-file interface (no -s/-p flags), and it force-updates itself
+ *  on first start (which kills the process) — so we re-extract the pinned build on every
+ *  (re)start and keep a supervisor on it. */
+function extractAgent(zipPath) {
+  const files = unzipTo(zipPath, path.join(WORK, 'nezha'));
+  const real = files.find((f) => f.endsWith('nezha-agent')) || files[0];
+  const dest = path.join(BIN, 'nezha-agent');
+  fs.copyFileSync(real, dest);
+  chmodX(dest);
+  return dest;
+}
+
+function writeNezhaConfig() {
+  const srv = NEZHA_SERVER.includes(':') ? NEZHA_SERVER : `${NEZHA_SERVER}:${NEZHA_PORT || 443}`;
+  const tls = ['443', '8443', '2096', '2087', '2083', '2053'].includes(String(NEZHA_PORT));
+  const yaml = [
+    'debug: false',
+    `server: ${srv}`,
+    `client_secret: ${NEZHA_KEY}`,
+    `tls: ${tls}`,
+    'insecure_tls: false',
+    'disable_auto_update: true',
+    'disable_force_update: true',
+    'disable_command_execute: false',
+    'disable_nat: false',
+    'disable_send_query: false',
+    'use_gitee_to_upgrade: false',
+    'report_delay: 3',
+    '',
+  ].join('\n');
+  const p = path.join(WORK, 'nezha-config.yaml');
+  fs.writeFileSync(p, yaml);
+  return { p, srv, tls };
+}
+
+function startNezhaSupervised(zipPath) {
+  const { p: cfg, srv, tls } = writeNezhaConfig();
+  const baseEnv = {
+    ...CHILD_ENV(),
+    NZ_SERVER: srv, NZ_CLIENT_SECRET: NEZHA_KEY, NZ_TLS: tls ? 'true' : 'false',
+    NZ_DISABLE_AUTO_UPDATE: 'true', NZ_DISABLE_FORCE_UPDATE: 'true',
+    NZ_INSECURE_TLS: 'false', NZ_REPORT_DELAY: '3',
+  };
+  log(`nezha target ${srv} tls=${tls} cfg=${cfg}`);
+  let tries = 0;
+  const boot = () => {
+    let bin;
+    try { bin = extractAgent(zipPath); } catch (e) { log('nezha extract failed:', e.message); return; }
+    const c = spawn(bin, ['-c', cfg], { stdio: ['ignore', 'pipe', 'pipe'], env: baseEnv, cwd: WORK });
+    c.stdout.on('data', (d) => process.stdout.write(`[nezha] ${d}`));
+    c.stderr.on('data', (d) => process.stdout.write(`[nezha] ${d}`));
+    c.on('exit', (code) => {
+      tries++;
+      if (tries <= 8) {
+        log(`nezha exited code=${code} -> respawn #${tries} in 5s`);
+        setTimeout(boot, 5000);
+      } else {
+        log('nezha: giving up after 8 restarts');
+      }
+    });
+  };
+  boot();
+}
+
 async function main() {
   log('=== infrlo bootstrap v2 (xray) ===');
   log(`arch=${os.arch()} node=${process.version} cpus=${os.cpus().length} mem=${Math.round(os.totalmem() / 1048576)}MB uid=${process.getuid()} work=${WORK}`);
@@ -217,31 +281,7 @@ async function main() {
   }
 
   if (nezha) {
-    const srv = NEZHA_SERVER.includes(':') ? NEZHA_SERVER : `${NEZHA_SERVER}:${NEZHA_PORT || 443}`;
-    const tlsPorts = ['443', '8443', '2096', '2087', '2083', '2053'];
-    const useTls = tlsPorts.includes(String(NEZHA_PORT));
-    const args = ['-s', srv, '-p', NEZHA_KEY];
-    if (useTls) args.push('--tls');
-    log(`starting nezha agent: ${args.join(' ').replace(NEZHA_KEY, '***')}`);
-    let startedAt = Date.now();
-    let child = startProc('nezha', nezha, args);
-    child.on('exit', (code) => {
-      // v2 agent line rejects -s/-p: retry with the config/env interface
-      if (code !== 0 && Date.now() - startedAt < 15000) {
-        log('nezha: CLI flags rejected -> retrying with env-var config (NZ_*)');
-        const env = {
-          ...CHILD_ENV(),
-          NZ_SERVER: srv, NZ_CLIENT_SECRET: NEZHA_KEY,
-          NZ_TLS: useTls ? 'true' : 'false', NZ_DISABLE_COMMAND_EXECUTE: 'false',
-          NZ_DISABLE_FORCE_UPDATE: 'true',
-        };
-        const c2 = spawn(nezha, [], { stdio: ['ignore', 'pipe', 'pipe'], env });
-        c2.stdout.on('data', (d) => process.stdout.write(`[nezha2] ${d}`));
-        c2.stderr.on('data', (d) => process.stdout.write(`[nezha2] ${d}`));
-        c2.on('exit', (c) => log(`nezha2 exited code=${c}`));
-        startedAt = Date.now();
-      }
-    });
+    startNezhaSupervised(nezha, path.join(WORK, 'nezha-agent.zip'));
   } else {
     log('nezha: skipped (NEZHA_SERVER/NEZHA_KEY not set)');
   }
