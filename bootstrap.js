@@ -122,11 +122,12 @@ async function getNezhaAgent() {
   const dest = path.join(BIN, 'nezha-agent');
   if (fs.existsSync(dest)) return dest;
   const zip = path.join(WORK, 'nezha-agent.zip');
-  // pin v1.0.1: the v2.x agent line dropped the -s/-p CLI flags (config/env only),
-  // and this panel is a v0 (0.17.9) box which speaks the v1 agent protocol.
+  // pin the v0 agent line (last tag v0.20.5): panel is nezha v0.17.9
+  const ver = process.env.NEZHA_AGENT_VERSION || 'v0.20.5';
+  const archAgent = os.arch() === 'arm64' ? 'arm64' : 'amd64';
   for (const url of [
-    'https://github.com/nezhahq/agent/releases/download/v1.0.1/nezha-agent_linux_amd64.zip',
-    'https://github.com/nezhahq/agent/releases/latest/download/nezha-agent_linux_amd64.zip',
+    `https://github.com/nezhahq/agent/releases/download/${ver}/nezha-agent_linux_${archAgent}.zip`,
+    `https://github.com/nezhahq/agent/releases/latest/download/nezha-agent_linux_${archAgent}.zip`,
   ]) {
     try {
       await download(url, zip);
@@ -169,9 +170,12 @@ function link(host) {
   return `vless://${UUID}@${host}:443?encryption=none&security=tls&sni=${host}&fp=chrome&type=ws&host=${host}&path=%2Fws&allowInsecure=0#${encodeURIComponent(NAME)}`;
 }
 
-/** nezha v1 agent: config-file interface (no -s/-p flags), and it force-updates itself
- *  on first start (which kills the process) — so we re-extract the pinned build on every
- *  (re)start and keep a supervisor on it. */
+/** Nezha agent.
+ *  The panel here is a v0 (0.17.9) box -> needs the v0 agent line (last tag v0.20.5),
+ *  which still takes the classic "-s server:port -p secret [--tls]" flags.
+ *  If the agent rejects those flags we fall back to the v1+ config-file interface.
+ *  The agent force-updates itself on start, so we keep a pinned copy and re-copy it
+ *  before every (re)spawn. */
 function extractAgent() {
   const pinned = path.join(BIN, 'nezha-agent.pinned');
   const dest = path.join(BIN, 'nezha-agent');
@@ -181,8 +185,7 @@ function extractAgent() {
 }
 
 function writeNezhaConfig() {
-  const srv = NEZHA_SERVER.includes(':') ? NEZHA_SERVER : `${NEZHA_SERVER}:${NEZHA_PORT || 443}`;
-  const tls = ['443', '8443', '2096', '2087', '2083', '2053'].includes(String(NEZHA_PORT));
+  const { srv, tls } = nezhaTarget();
   const yaml = [
     'debug: false',
     `server: ${srv}`,
@@ -200,32 +203,47 @@ function writeNezhaConfig() {
   ].join('\n');
   const p = path.join(WORK, 'nezha-config.yaml');
   fs.writeFileSync(p, yaml);
-  return { p, srv, tls };
+  return p;
+}
+
+function nezhaTarget() {
+  const srv = NEZHA_SERVER.includes(':') ? NEZHA_SERVER : `${NEZHA_SERVER}:${NEZHA_PORT || 443}`;
+  const tls = ['443', '8443', '2096', '2087', '2083', '2053'].includes(String(NEZHA_PORT));
+  return { srv, tls };
 }
 
 function startNezhaSupervised() {
-  const { p: cfg, srv, tls } = writeNezhaConfig();
-  const baseEnv = {
-    ...CHILD_ENV(),
-    NZ_SERVER: srv, NZ_CLIENT_SECRET: NEZHA_KEY, NZ_TLS: tls ? 'true' : 'false',
-    NZ_DISABLE_AUTO_UPDATE: 'true', NZ_DISABLE_FORCE_UPDATE: 'true',
-    NZ_INSECURE_TLS: 'false', NZ_REPORT_DELAY: '3',
-  };
-  log(`nezha target ${srv} tls=${tls} cfg=${cfg}`);
+  const { srv, tls } = nezhaTarget();
+  let mode = process.env.NEZHA_ARG_MODE || 'flags';
   let tries = 0;
+  log(`nezha target ${srv} tls=${tls} mode=${mode}`);
   const boot = () => {
     let bin;
     try { bin = extractAgent(); } catch (e) { log('nezha extract failed:', e.message); return; }
-    const c = spawn(bin, ['-c', cfg], { stdio: ['ignore', 'pipe', 'pipe'], env: baseEnv, cwd: WORK });
+    const args = mode === 'flags' ? ['-s', srv, '-p', NEZHA_KEY, ...(tls ? ['--tls'] : [])] : ['-c', writeNezhaConfig()];
+    const env = {
+      ...CHILD_ENV(),
+      NZ_SERVER: srv, NZ_CLIENT_SECRET: NEZHA_KEY, NZ_TLS: tls ? 'true' : 'false',
+      NZ_DISABLE_AUTO_UPDATE: 'true', NZ_DISABLE_FORCE_UPDATE: 'true', NZ_REPORT_DELAY: '3',
+    };
+    log(`starting nezha: ${mode} ${args.join(' ').replace(NEZHA_KEY, '***')}`);
+    const startedAt = Date.now();
+    const c = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], env, cwd: WORK });
     c.stdout.on('data', (d) => process.stdout.write(`[nezha] ${d}`));
     c.stderr.on('data', (d) => process.stdout.write(`[nezha] ${d}`));
     c.on('exit', (code) => {
+      if (mode === 'flags' && Date.now() - startedAt < 8000) {
+        log('nezha: flag interface rejected -> switching to config-file mode');
+        mode = 'config';
+        setTimeout(boot, 2000);
+        return;
+      }
       tries++;
-      if (tries <= 8) {
-        log(`nezha exited code=${code} -> respawn #${tries} in 5s`);
-        setTimeout(boot, 5000);
+      if (tries <= 10) {
+        log(`nezha exited code=${code} -> respawn #${tries} in 6s`);
+        setTimeout(boot, 6000);
       } else {
-        log('nezha: giving up after 8 restarts');
+        log('nezha: giving up after 10 restarts');
       }
     });
   };
