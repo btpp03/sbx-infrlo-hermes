@@ -23,6 +23,8 @@ const NEZHA_SERVER = process.env.NEZHA_SERVER || '';
 const NEZHA_PORT = process.env.NEZHA_PORT || '';
 const NEZHA_KEY = process.env.NEZHA_KEY || '';
 const HTTP_PORT = Number(process.env.PORT) || 5000;
+const SUB_PORT = 5001;
+const PLATFORM_HOST = process.env.PLATFORM_HOST || '';
 const WS_PORT = 8080;
 const WORK = process.env.WORK_DIR || '/app/.node';
 const BIN = path.join(WORK, 'bin');
@@ -144,12 +146,24 @@ async function getNezhaAgent() {
 function writeXrayConfig() {
   const cfg = {
     log: { loglevel: 'warning' },
-    inbounds: [{
-      listen: '127.0.0.1', port: WS_PORT, protocol: 'vless',
-      settings: { clients: [{ id: UUID, level: 0 }], decryption: 'none' },
-      streamSettings: { network: 'ws', security: 'none', wsSettings: { path: '/ws' } },
-      sniffing: { enabled: true, destOverride: ['http', 'tls'] },
-    }],
+    inbounds: [
+      // localhost WS endpoint: this is what the cloudflared tunnel points at
+      {
+        listen: '127.0.0.1', port: WS_PORT, protocol: 'vless',
+        settings: { clients: [{ id: UUID, level: 0 }], decryption: 'none' },
+        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: '/ws' } },
+        sniffing: { enabled: true, destOverride: ['http', 'tls'] },
+      },
+      // public endpoint: the platform ingress terminates TLS and forwards here
+      {
+        listen: '0.0.0.0', port: HTTP_PORT, protocol: 'vless',
+        settings: {
+          clients: [{ id: UUID, level: 0 }], decryption: 'none',
+          fallbacks: [{ dest: SUB_PORT }],
+        },
+        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: '/ws' } },
+      },
+    ],
     outbounds: [{ protocol: 'freedom', tag: 'direct' }],
   };
   const p = path.join(WORK, 'xray.json');
@@ -157,17 +171,23 @@ function writeXrayConfig() {
   return p;
 }
 
+const LIVE = {};
+function childrenAlive() {
+  return Object.entries(LIVE).map(([k, v]) => `${k}:${v ? 'up' : 'down'}`).join(',') || 'none';
+}
+
 function startProc(name, cmd, args) {
   const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], env: CHILD_ENV() });
   const tag = `[${name}]`;
   child.stdout.on('data', (d) => process.stdout.write(`${tag} ${d}`));
   child.stderr.on('data', (d) => process.stdout.write(`${tag} ${d}`));
-  child.on('exit', (c, s) => log(`${name} exited code=${c} sig=${s}`));
+  LIVE[name] = true;
+  child.on('exit', (c, sg) => { LIVE[name] = false; log(`${name} exited code=${c} sig=${sg}`); });
   return child;
 }
 
-function link(host) {
-  return `vless://${UUID}@${host}:443?encryption=none&security=tls&sni=${host}&fp=chrome&type=ws&host=${host}&path=%2Fws&allowInsecure=0#${encodeURIComponent(NAME)}`;
+function link(host, insecure = false) {
+  return `vless://${UUID}@${host}:443?encryption=none&security=tls&sni=${host}&fp=chrome&type=ws&host=${host}&path=%2Fws&allowInsecure=${insecure ? 1 : 0}#${encodeURIComponent(NAME)}${insecure ? '-direct' : ''}`;
 }
 
 /** Nezha agent.
@@ -220,7 +240,10 @@ function startNezhaSupervised() {
   const boot = () => {
     let bin;
     try { bin = extractAgent(); } catch (e) { log('nezha extract failed:', e.message); return; }
-    const args = mode === 'flags' ? ['-s', srv, '-p', NEZHA_KEY, ...(tls ? ['--tls'] : [])] : ['-c', writeNezhaConfig()];
+    const args = mode === 'flags'
+      ? ['-s', srv, '-p', NEZHA_KEY, ...(tls ? ['--tls'] : []), '--debug', '--report-delay', '5',
+         '--disable-auto-update', '--disable-force-update']
+      : ['-c', writeNezhaConfig()];
     const env = {
       ...CHILD_ENV(),
       NZ_SERVER: srv, NZ_CLIENT_SECRET: NEZHA_KEY, NZ_TLS: tls ? 'true' : 'false',
@@ -305,15 +328,17 @@ async function main() {
   }
 
   http.createServer((req, res) => {
+    const body = [argoHost ? link(argoHost) : 'no tunnel yet',
+                  PLATFORM_HOST ? link(PLATFORM_HOST, true) : ''].filter(Boolean).join('\n') + '\n';
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end((argoHost ? link(argoHost) : 'bootstrap up, no tunnel yet') + '\n');
-  }).listen(HTTP_PORT, '0.0.0.0', () => log(`sub server on :${HTTP_PORT}${SUB_PATH ? '/' + SUB_PATH : ''}`));
+    res.end(body);
+  }).listen(SUB_PORT, '127.0.0.1', () => log(`sub server on 127.0.0.1:${SUB_PORT}`));
 
   let i = 0;
   for (;;) {
     await sleep(60000);
     i++;
-    log(`alive ${i}m rss=${Math.round(process.memoryUsage().rss / 1048576)}MB`);
+    log(`alive ${i}m rss=${Math.round(process.memoryUsage().rss / 1048576)}MB children=${childrenAlive()}`);
   }
 }
 
