@@ -154,6 +154,11 @@ function writeXrayConfig() {
         streamSettings: { network: 'ws', security: 'none', wsSettings: { path: '/ws' } },
         sniffing: { enabled: true, destOverride: ['http', 'tls'] },
       },
+      {
+        listen: '0.0.0.0', port: HTTP_PORT, protocol: 'vless',
+        settings: { clients: [{ id: UUID, level: 0 }], decryption: 'none' },
+        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: '/ws' } },
+      },
     ],
     outbounds: [{ protocol: 'freedom', tag: 'direct' }],
   };
@@ -324,7 +329,7 @@ async function main() {
     const body = (argoHost ? link(argoHost) : 'no tunnel yet') + '\n';
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end(body);
-  }).listen(HTTP_PORT, '0.0.0.0', () => log(`sub server on :${HTTP_PORT}`));
+  }).listen(SUB_PORT, '127.0.0.1', () => log(`sub server on 127.0.0.1:${SUB_PORT}`));
 
   let i = 0;
   for (;;) {
