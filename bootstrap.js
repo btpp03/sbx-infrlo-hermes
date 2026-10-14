@@ -239,7 +239,8 @@ function startNezhaSupervised() {
     try { bin = extractAgent(); } catch (e) { log('nezha extract failed:', e.message); return; }
     const args = mode === 'flags'
       ? ['-s', srv, '-p', NEZHA_KEY, ...(tls ? ['--tls'] : []), '--debug',
-         '--disable-auto-update', '--disable-force-update', '--report-delay', '3']
+         '--disable-auto-update', '--disable-force-update', '--report-delay', '3',
+         '--skip-procs', '--skip-conn', '--disable-send-query', '--disable-nat']
       : ['-c', writeNezhaConfig()];
     const env = {
       ...CHILD_ENV(),
